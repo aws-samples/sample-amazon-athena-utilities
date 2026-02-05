@@ -1,0 +1,53 @@
+# Ignore OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Ignore temporary files
+*.tmp
+*.temp
+*.log
+
+# Ignore AWS credentials and config
+.aws/
+aws-credentials.json
+*.pem
+*.key
+
+# Ignore CloudFormation outputs
+stack-outputs.json
+deployment-logs/
+
+# Ignore test artifacts
+test-results/
+coverage/
+
+# Ignore local environment files
+.env
+.env.local
+.env.*.local
+
+# Ignore backup files
+*.bak
+*.backup
+*~
+
+# Ignore compressed files
+*.zip
+*.tar.gz
+*.rar
+
+# Ignore local deployment scripts with secrets
+deploy-with-secrets.sh
+local-config.sh

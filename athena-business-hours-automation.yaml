@@ -1,0 +1,459 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Business Hours Athena Capacity Reservation with Auto-Scaling Lifecycle'
+
+Parameters:
+  WorkgroupName:
+    Type: String
+    Description: 'Existing Athena workgroup to attach to capacity reservation'
+    Default: 'primary'
+  
+  InitialCapacity:
+    Type: Number
+    Default: 24
+    MinValue: 24
+    Description: 'Initial DPU capacity (minimum 24)'
+  
+  MaxCapacity:
+    Type: Number
+    Default: 64
+    MinValue: 24
+    Description: 'Maximum DPU capacity for auto-scaling'
+  
+  StartTime:
+    Type: String
+    Default: '0 8 ? * MON-FRI *'
+    Description: 'Business start time (cron expression - default 8 AM weekdays)'
+  
+  EndTime:
+    Type: String
+    Default: '0 17 ? * MON-FRI *'
+    Description: 'Business end time (cron expression - default 5 PM weekdays)'
+  
+  StartImmediately:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: 'Start capacity reservation immediately for testing (true/false)'
+
+Conditions:
+  ShouldStartImmediately: !Equals [!Ref StartImmediately, 'true']
+
+Resources:
+  # Step Functions State Machine
+  BusinessHoursOrchestrator:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-BusinessHoursOrchestrator'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Orchestrate Athena business hours capacity lifecycle",
+          "StartAt": "CheckAction",
+          "States": {
+            "CheckAction": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.action",
+                  "StringEquals": "start",
+                  "Next": "StartBusinessHours"
+                },
+                {
+                  "Variable": "$.action",
+                  "StringEquals": "stop",
+                  "Next": "StopBusinessHours"
+                }
+              ],
+              "Default": "InvalidAction"
+            },
+            "StartBusinessHours": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StartCapacityFunction}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.lambdaResult",
+              "Next": "WaitForCapacityReady"
+            },
+            "WaitForCapacityReady": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "DeployAutoScaling"
+            },
+            "DeployAutoScaling": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudformation:createStack",
+              "Parameters": {
+                "StackName.$": "States.Format('{}-autoscaling', $.workgroup)",
+                "TemplateURL": "https://athena-downloads.s3.us-east-1.amazonaws.com/templates/capacity-reservation-scaling/state-machine/athena-capacity-reservation-scaling-template-v1.0.yaml",
+                "Parameters": [
+                  {
+                    "ParameterKey": "AthenaCapacityReservationName",
+                    "ParameterValue.$": "$.workgroup"
+                  },
+                  {
+                    "ParameterKey": "MaxTargetDpus",
+                    "ParameterValue.$": "States.Format('{}', $.maxCapacity)"
+                  }
+                ],
+                "Capabilities": ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"]
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "NotifyStart"
+            },
+            "StopBusinessHours": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StopCapacityFunction}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.lambdaResult",
+              "Next": "DeleteAutoScalingStack"
+            },
+            "DeleteAutoScalingStack": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudformation:deleteStack",
+              "Parameters": {
+                "StackName.$": "States.Format('{}-autoscaling', $.workgroup)"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "IntervalSeconds": 30,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "WaitForStackDeletion"
+            },
+            "WaitForStackDeletion": {
+              "Type": "Wait",
+              "Seconds": 120,
+              "Next": "NotifyStop"
+            },
+            "NotifyStart": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Message": "Business hours Athena capacity started with auto-scaling enabled",
+                "Subject": "Athena Business Hours - Started"
+              },
+              "End": true
+            },
+            "NotifyStop": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${NotificationTopic}",
+                "Message": "Business hours Athena capacity stopped and auto-scaling removed",
+                "Subject": "Athena Business Hours - Stopped"
+              },
+              "End": true
+            },
+            "InvalidAction": {
+              "Type": "Fail",
+              "Error": "InvalidAction",
+              "Cause": "Action must be 'start' or 'stop'"
+            }
+          }
+        }
+
+  # IAM Roles
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref BusinessHoursOrchestrator
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - sns:Publish
+                  - states:StartExecution
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - states:CreateStateMachine
+                  - states:DeleteStateMachine
+                  - states:DescribeStateMachine
+                  - states:TagResource
+                  - states:UntagResource
+                  - states:ListTagsForResource
+                  - events:PutRule
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:PutTargets
+                  - events:RemoveTargets
+                  - events:ListTargetsByRule
+                Resource: '*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaCapacityManagement
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:CreateCapacityReservation
+                  - athena:DeleteCapacityReservation
+                  - athena:GetCapacityReservation
+                  - athena:ListCapacityReservations
+                  - athena:PutWorkGroup
+                  - athena:UpdateWorkGroup
+                  - states:StartExecution
+                Resource: '*'
+
+  # Custom Resource for Immediate Start
+  ImmediateStartTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: ShouldStartImmediately
+    Properties:
+      ServiceToken: !GetAtt ImmediateStartFunction.Arn
+      WorkgroupName: !Ref WorkgroupName
+      InitialCapacity: !Ref InitialCapacity
+      MaxCapacity: !Ref MaxCapacity
+
+  ImmediateStartFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldStartImmediately
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ImmediateStart'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Create':
+                      stepfunctions = boto3.client('stepfunctions')
+                      
+                      input_data = {
+                          "action": "start",
+                          "workgroup": event['ResourceProperties']['WorkgroupName'],
+                          "initialCapacity": int(event['ResourceProperties']['InitialCapacity']),
+                          "maxCapacity": int(event['ResourceProperties']['MaxCapacity'])
+                      }
+                      
+                      response = stepfunctions.start_execution(
+                          stateMachineArn="${BusinessHoursOrchestrator}",
+                          input=json.dumps(input_data)
+                      )
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'ExecutionArn': response['executionArn']
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # EventBridge Rules
+  StartBusinessHoursRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger Athena capacity start at business hours'
+      ScheduleExpression: !Sub 'cron(${StartTime})'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref BusinessHoursOrchestrator
+          Id: 'StartBusinessHoursTarget'
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Input: !Sub |
+            {
+              "action": "start",
+              "workgroup": "${WorkgroupName}",
+              "initialCapacity": ${InitialCapacity},
+              "maxCapacity": ${MaxCapacity}
+            }
+
+  StopBusinessHoursRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Trigger Athena capacity stop at end of business hours'
+      ScheduleExpression: !Sub 'cron(${EndTime})'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref BusinessHoursOrchestrator
+          Id: 'StopBusinessHoursTarget'
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Input: !Sub |
+            {
+              "action": "stop",
+              "workgroup": "${WorkgroupName}"
+            }
+
+  # Lambda Functions
+  StartCapacityFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StartCapacity'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def lambda_handler(event, context):
+              try:
+                  athena = boto3.client('athena')
+                  
+                  workgroup = event['workgroup']
+                  capacity = event['initialCapacity']
+                  
+                  # Create capacity reservation
+                  response = athena.create_capacity_reservation(
+                      Name=workgroup,
+                      TargetDpus=capacity
+                  )
+                  
+                  # Attach to workgroup
+                  athena.update_work_group(
+                      WorkGroup=workgroup,
+                      ConfigurationUpdates={
+                          'AdditionalConfiguration': f'capacity_reservation_name={workgroup}'
+                      }
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Capacity reservation {workgroup} created with {capacity} DPUs')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  StopCapacityFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StopCapacity'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def lambda_handler(event, context):
+              try:
+                  athena = boto3.client('athena')
+                  
+                  workgroup = event['workgroup']
+                  
+                  # Remove from workgroup
+                  athena.update_work_group(
+                      WorkGroup=workgroup,
+                      ConfigurationUpdates={
+                          'RemoveAdditionalConfiguration': ['capacity_reservation_name']
+                      }
+                  )
+                  
+                  # Delete capacity reservation
+                  athena.delete_capacity_reservation(Name=workgroup)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Capacity reservation {workgroup} deleted')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  # SNS Topic
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+
+Outputs:
+  StateMachineArn:
+    Description: 'Step Functions State Machine ARN'
+    Value: !Ref BusinessHoursOrchestrator
+  
+  NotificationTopicArn:
+    Description: 'SNS Topic for notifications'
+    Value: !Ref NotificationTopic
+    
+  TemplateLocation:
+    Description: 'File location for upload'
+    Value: '/Users/pathshah/athena-business-hours-automation-clean.yaml'
+  
+  TestingInstructions:
+    Description: 'How to test the automation'
+    Value: !If 
+      - ShouldStartImmediately
+      - 'Capacity reservation started automatically for testing. Check Step Functions console for execution status.'
+      - 'Set StartImmediately=true to test immediately, or wait for scheduled business hours.'

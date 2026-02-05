@@ -1,0 +1,43 @@
+name: Validate CloudFormation Template
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+        
+    - name: Validate CloudFormation template
+      run: |
+        aws cloudformation validate-template \
+          --template-body file://athena-business-hours-automation.yaml
+          
+    - name: Check template formatting
+      run: |
+        # Check for common YAML issues
+        python -c "import yaml; yaml.safe_load(open('athena-business-hours-automation.yaml'))"
+        
+    - name: Lint CloudFormation template
+      uses: scottbrenner/cfn-lint-action@v2
+      with:
+        file: athena-business-hours-automation.yaml
+        
+    - name: Security scan with cfn-nag
+      uses: stelligent/cfn_nag@master
+      with:
+        input_path: athena-business-hours-automation.yaml
+        extra_args: --fail-on-warnings
