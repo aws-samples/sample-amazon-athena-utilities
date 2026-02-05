@@ -35,6 +35,55 @@ Parameters:
     AllowedValues: ['true', 'false']
     Description: 'Start capacity reservation immediately for testing (true/false)'
 
+  # Auto-scaling Configuration Parameters
+  MinTargetDpus:
+    Type: String
+    Default: "24"
+    Description: Minimum number of DPUs allowed to scale down to. Must be a positive multiple of 4 with a minimum value of 24. Ensure MaxCapacity > MinTargetDpus.
+    AllowedPattern: "^(2[48]|[468][048]|[3579][26]|[1-9][0-9]*([02468][048]|[13579][26]))$"
+    ConstraintDescription: "The number of DPUs must be a positive multiple of 4 with a minimum value of 24."
+
+  ScaleOutDpuAmount:
+    Type: String
+    Default: "16"
+    Description: Number of DPUs to add in response to high utilization signal. Must be a positive multiple of 4.
+    AllowedPattern: "^([48]|[2468][048]|[13579][26]|[1-9][0-9]*([02468][048]|[13579][26]))$"
+    ConstraintDescription: "The number of DPUs must be a positive multiple of 4."
+
+  ScaleInDpuAmount:
+    Type: String
+    Default: "8"
+    Description: Number of DPUs to remove in response to low utilization signal. Must be a positive multiple of 4.
+    AllowedPattern: "^([48]|[2468][048]|[13579][26]|[1-9][0-9]*([02468][048]|[13579][26]))$"
+    ConstraintDescription: "The number of DPUs must be a positive multiple of 4."
+
+  HighUtilizationThreshold:
+    Type: Number
+    Default: 75
+    MinValue: 0
+    MaxValue: 100
+    Description: Utilization threshold above which additional capacity is requested. Must be between 0 and 100. Ensure HighUtilizationThreshold > LowUtilizationThreshold.
+
+  LowUtilizationThreshold:
+    Type: Number
+    Default: 25
+    MinValue: 0
+    MaxValue: 100
+    Description: Utilization threshold below which capacity is removed. Must be between 0 and 100. Ensure HighUtilizationThreshold > LowUtilizationThreshold.
+
+  EvaluationLookbackWindow:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    Description: Amount of time, measured in seconds, to measure historical capacity utilization. Must be a positive multiple of 60.
+
+  EvaluationFrequency:
+    Type: String
+    Default: 'rate(5 minutes)'
+    MinLength: 1
+    MaxLength: 256
+    Description: Frequency of utilization evaluation and updates to capacity if needed. Must be an EventBridge schedule expression, e.g. rate(5 minutes).
+
 Conditions:
   ShouldStartImmediately: !Equals [!Ref StartImmediately, 'true']
 
@@ -95,6 +144,34 @@ Resources:
                   {
                     "ParameterKey": "MaxTargetDpus",
                     "ParameterValue.$": "States.Format('{}', $.maxCapacity)"
+                  },
+                  {
+                    "ParameterKey": "MinTargetDpus",
+                    "ParameterValue": "${MinTargetDpus}"
+                  },
+                  {
+                    "ParameterKey": "ScaleOutDpuAmount",
+                    "ParameterValue": "${ScaleOutDpuAmount}"
+                  },
+                  {
+                    "ParameterKey": "ScaleInDpuAmount",
+                    "ParameterValue": "${ScaleInDpuAmount}"
+                  },
+                  {
+                    "ParameterKey": "HighUtilizationThreshold",
+                    "ParameterValue": "${HighUtilizationThreshold}"
+                  },
+                  {
+                    "ParameterKey": "LowUtilizationThreshold",
+                    "ParameterValue": "${LowUtilizationThreshold}"
+                  },
+                  {
+                    "ParameterKey": "EvaluationLookbackWindow",
+                    "ParameterValue": "${EvaluationLookbackWindow}"
+                  },
+                  {
+                    "ParameterKey": "EvaluationFrequency",
+                    "ParameterValue": "${EvaluationFrequency}"
                   }
                 ],
                 "Capabilities": ["CAPABILITY_IAM", "CAPABILITY_NAMED_IAM"]
@@ -258,8 +335,11 @@ Resources:
                 Action:
                   - athena:CreateCapacityReservation
                   - athena:DeleteCapacityReservation
+                  - athena:CancelCapacityReservation
                   - athena:GetCapacityReservation
                   - athena:ListCapacityReservations
+                  - athena:PutCapacityAssignmentConfiguration
+                  - athena:GetCapacityAssignmentConfiguration
                   - athena:PutWorkGroup
                   - athena:UpdateWorkGroup
                   - states:StartExecution
@@ -377,12 +457,14 @@ Resources:
                       TargetDpus=capacity
                   )
                   
-                  # Attach to workgroup
-                  athena.update_work_group(
-                      WorkGroup=workgroup,
-                      ConfigurationUpdates={
-                          'AdditionalConfiguration': f'capacity_reservation_name={workgroup}'
-                      }
+                  # Attach workgroup to capacity reservation
+                  athena.put_capacity_assignment_configuration(
+                      CapacityReservationName=workgroup,
+                      CapacityAssignments=[
+                          {
+                              'WorkGroupNames': [workgroup]
+                          }
+                      ]
                   )
                   
                   return {
@@ -401,10 +483,12 @@ Resources:
       Runtime: python3.9
       Handler: index.lambda_handler
       Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 360
       Code:
         ZipFile: |
           import boto3
           import json
+          import time
           
           def lambda_handler(event, context):
               try:
@@ -412,20 +496,31 @@ Resources:
                   
                   workgroup = event['workgroup']
                   
-                  # Remove from workgroup
-                  athena.update_work_group(
-                      WorkGroup=workgroup,
-                      ConfigurationUpdates={
-                          'RemoveAdditionalConfiguration': ['capacity_reservation_name']
-                      }
-                  )
+                  # Cancel capacity reservation first
+                  athena.cancel_capacity_reservation(Name=workgroup)
                   
-                  # Delete capacity reservation
+                  # Wait for cancellation to complete
+                  max_attempts = 30  # 5 minutes max
+                  for attempt in range(max_attempts):
+                      response = athena.get_capacity_reservation(Name=workgroup)
+                      state = response['CapacityReservation']['Status']
+                      
+                      if state == 'CANCELLED':
+                          break
+                      elif state == 'CANCELLING':
+                          time.sleep(10)  # Wait 10 seconds
+                          continue
+                      else:
+                          raise Exception(f"Unexpected capacity reservation state: {state}")
+                  else:
+                      raise Exception("Timeout waiting for capacity reservation to cancel")
+                  
+                  # Delete capacity reservation (after cancellation completes)
                   athena.delete_capacity_reservation(Name=workgroup)
                   
                   return {
                       'statusCode': 200,
-                      'body': json.dumps(f'Capacity reservation {workgroup} deleted')
+                      'body': json.dumps(f'Capacity reservation {workgroup} cancelled and deleted')
                   }
                   
               except Exception as e:

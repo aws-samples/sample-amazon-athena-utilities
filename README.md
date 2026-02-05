@@ -1,4 +1,4 @@
-# Athena Business Hours Automation
+# Amazon Athena Capacity Reservation Business Hours Automation
 
 Automate Amazon Athena capacity reservations for business hours with integrated auto-scaling using AWS Step Functions, EventBridge, and CloudFormation.
 
@@ -45,13 +45,32 @@ aws cloudformation create-stack \
   --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
 ```
 
-### 2. Monitor Deployment
+### 2. Deploy with Custom Auto-scaling
+
+```bash
+aws cloudformation create-stack \
+  --stack-name athena-business-hours \
+  --template-body file://athena-business-hours-automation.yaml \
+  --parameters \
+    ParameterKey=WorkgroupName,ParameterValue=primary \
+    ParameterKey=InitialCapacity,ParameterValue=32 \
+    ParameterKey=MaxCapacity,ParameterValue=124 \
+    ParameterKey=HighUtilizationThreshold,ParameterValue=80 \
+    ParameterKey=ScaleOutDpuAmount,ParameterValue=24 \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
+```
 
 ```bash
 aws cloudformation describe-stacks --stack-name athena-business-hours
 ```
 
-### 3. Test Step Functions
+### 3. Monitor Deployment
+
+```bash
+aws cloudformation describe-stacks --stack-name athena-business-hours
+```
+
+### 4. Test Step Functions
 
 Check the Step Functions console for execution status when `StartImmediately=true`.
 
@@ -65,6 +84,18 @@ Check the Step Functions console for execution status when `StartImmediately=tru
 | `StartTime` | `0 8 ? * MON-FRI *` | Business start time (8 AM weekdays) |
 | `EndTime` | `0 17 ? * MON-FRI *` | Business end time (5 PM weekdays) |
 | `StartImmediately` | `false` | Start capacity immediately for testing |
+
+### Auto-scaling Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `MinTargetDpus` | `"24"` | Minimum DPUs for auto-scaling (must be ≥ 24) |
+| `ScaleOutDpuAmount` | `"16"` | DPUs to add when scaling up |
+| `ScaleInDpuAmount` | `"8"` | DPUs to remove when scaling down |
+| `HighUtilizationThreshold` | `75` | Scale up when utilization > 75% |
+| `LowUtilizationThreshold` | `25` | Scale down when utilization < 25% |
+| `EvaluationLookbackWindow` | `300` | Evaluation window in seconds (5 minutes) |
+| `EvaluationFrequency` | `'rate(5 minutes)'` | How often to check utilization |
 
 ## 📅 Schedule Configuration
 
@@ -87,13 +118,36 @@ EndTime: '59 23 ? * * *'         # Every day at 11:59 PM
 
 ## 🔧 Auto-scaling Configuration
 
-The template integrates with the official AWS Athena auto-scaling template with these defaults:
+The template integrates with the official AWS Athena auto-scaling template with these configurable parameters:
 
-- **High Utilization Threshold**: 75%
-- **Low Utilization Threshold**: 25%
-- **Scale Out Amount**: 16 DPUs
-- **Scale In Amount**: 8 DPUs
-- **Evaluation Frequency**: Every 5 minutes
+### Scaling Behavior
+- **High Utilization Threshold**: 75% (configurable)
+- **Low Utilization Threshold**: 25% (configurable)
+- **Scale Out Amount**: 16 DPUs (configurable)
+- **Scale In Amount**: 8 DPUs (configurable)
+- **Evaluation Window**: 5 minutes (configurable)
+- **Evaluation Frequency**: Every 5 minutes (configurable)
+
+### Custom Auto-scaling Example
+```bash
+aws cloudformation create-stack \
+  --stack-name athena-business-hours \
+  --template-body file://athena-business-hours-automation.yaml \
+  --parameters \
+    ParameterKey=WorkgroupName,ParameterValue=primary \
+    ParameterKey=HighUtilizationThreshold,ParameterValue=80 \
+    ParameterKey=LowUtilizationThreshold,ParameterValue=20 \
+    ParameterKey=ScaleOutDpuAmount,ParameterValue=20 \
+    ParameterKey=ScaleInDpuAmount,ParameterValue=12 \
+    ParameterKey=EvaluationFrequency,ParameterValue="rate(3 minutes)" \
+  --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM
+```
+
+### Scaling Logic
+1. **Monitor**: CloudWatch metrics every 5 minutes (configurable)
+2. **Scale Up**: When utilization > 75% and current < max capacity
+3. **Scale Down**: When utilization < 25% and current > min capacity
+4. **Limits**: Always stays between MinTargetDpus and MaxCapacity
 
 ## 💰 Cost Considerations
 
@@ -129,6 +183,7 @@ https://console.aws.amazon.com/states/home?region=us-east-1#/statemachines
 2. **IAM Permissions**: Ensure CloudFormation has necessary IAM permissions
 3. **Workgroup Not Found**: Verify workgroup exists before deployment
 4. **Auto-scaling Deployment Fails**: Check Step Functions role permissions
+5. **Capacity Cancellation Timeout**: Lambda timeout increased to 6 minutes for proper cleanup
 
 ### Debug Steps
 
@@ -145,6 +200,16 @@ https://console.aws.amazon.com/states/home?region=us-east-1#/statemachines
 3. **Check Capacity Reservation Status**:
    ```bash
    aws athena get-capacity-reservation --name primary
+   ```
+
+4. **Test Auto-scaling Parameters**:
+   ```bash
+   # Deploy with aggressive scaling for testing
+   aws cloudformation create-stack \
+     --parameters \
+       ParameterKey=HighUtilizationThreshold,ParameterValue=60 \
+       ParameterKey=LowUtilizationThreshold,ParameterValue=40 \
+       ParameterKey=EvaluationFrequency,ParameterValue="rate(2 minutes)"
    ```
 
 ## 🔒 Security
