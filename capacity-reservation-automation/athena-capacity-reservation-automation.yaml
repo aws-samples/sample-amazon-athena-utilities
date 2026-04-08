@@ -1,0 +1,957 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Combined Athena Capacity Reservation Business Hours Automation with Integrated Auto-scaling'
+
+Parameters:
+  WorkgroupName:
+    Type: String
+    Description: 'Existing Athena workgroup to attach to capacity reservation'
+    Default: 'primary'
+  
+  CapacityReservationName:
+    Type: String
+    Description: 'Name for the capacity reservation (leave empty to auto-generate)'
+    Default: ''
+  
+  InitialCapacity:
+    Type: Number
+    Default: 8
+    MinValue: 4
+    Description: 'Initial DPU capacity (minimum 4)'
+  
+  MaxCapacity:
+    Type: Number
+    Default: 32
+    MinValue: 4
+    Description: 'Maximum DPU capacity for auto-scaling'
+
+  # User-friendly time parameters
+  CapacityReservationStartTime:
+    Type: String
+    Default: '08:00'
+    Description: 'Capacity reservation start time (HH:MM format, 24-hour)'
+    AllowedPattern: '^([0-1][0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: 'Must be in HH:MM format (00:00 to 23:59)'
+
+  CapacityReservationEndTime:
+    Type: String
+    Default: '17:00'
+    Description: 'Capacity reservation end time (HH:MM format, 24-hour)'
+    AllowedPattern: '^([0-1][0-9]|2[0-3]):[0-5][0-9]$'
+    ConstraintDescription: 'Must be in HH:MM format (00:00 to 23:59)'
+
+  BusinessDays:
+    Type: String
+    Default: 'MON-FRI'
+    AllowedValues: ['MON-FRI', 'MON-SAT', 'MON-SUN', 'SAT-SUN']
+    Description: 'Business days (MON-FRI for weekdays, MON-SAT includes Saturday, etc.)'
+
+  TimeZone:
+    Type: String
+    Default: 'America/New_York'
+    Description: 'Timezone for capacity reservation hours'
+    AllowedValues:
+      # UTC
+      - 'UTC'
+      # Americas
+      - 'America/New_York'
+      - 'America/Chicago'
+      - 'America/Denver'
+      - 'America/Los_Angeles'
+      - 'America/Anchorage'
+      - 'America/Phoenix'
+      - 'America/Toronto'
+      - 'America/Vancouver'
+      - 'America/Mexico_City'
+      - 'America/Sao_Paulo'
+      - 'America/Buenos_Aires'
+      # Europe
+      - 'Europe/London'
+      - 'Europe/Paris'
+      - 'Europe/Berlin'
+      - 'Europe/Rome'
+      - 'Europe/Madrid'
+      - 'Europe/Amsterdam'
+      - 'Europe/Brussels'
+      - 'Europe/Vienna'
+      - 'Europe/Stockholm'
+      - 'Europe/Dublin'
+      - 'Europe/Zurich'
+      - 'Europe/Warsaw'
+      - 'Europe/Prague'
+      - 'Europe/Budapest'
+      - 'Europe/Athens'
+      - 'Europe/Istanbul'
+      - 'Europe/Moscow'
+      # Asia
+      - 'Asia/Tokyo'
+      - 'Asia/Seoul'
+      - 'Asia/Shanghai'
+      - 'Asia/Hong_Kong'
+      - 'Asia/Singapore'
+      - 'Asia/Bangkok'
+      - 'Asia/Mumbai'
+      - 'Asia/Dubai'
+      - 'Asia/Tel_Aviv'
+      - 'Asia/Jakarta'
+      - 'Asia/Manila'
+      - 'Asia/Taipei'
+      # Pacific
+      - 'Australia/Sydney'
+      - 'Australia/Melbourne'
+      - 'Australia/Brisbane'
+      - 'Australia/Perth'
+      - 'Pacific/Auckland'
+      - 'Pacific/Fiji'
+      # Africa
+      - 'Africa/Johannesburg'
+      - 'Africa/Cairo'
+      - 'Africa/Lagos'
+
+
+
+  # Auto-scaling Configuration Parameters
+  MinTargetDpus:
+    Type: String
+    Default: "4"
+    Description: Minimum number of DPUs allowed to scale down to. Must be a multiple of 4 with a minimum value of 4.
+    AllowedPattern: "^([4-9]|[1-9][0-9]+)$"
+    ConstraintDescription: "The number of DPUs must be at least 4."
+
+  ScaleOutDpuAmount:
+    Type: String
+    Default: "8"
+    Description: Number of DPUs to add in response to high utilization signal. Must be a multiple of 4.
+    AllowedPattern: "^([4-9]|[1-9][0-9]+)$"
+    ConstraintDescription: "The number of DPUs must be at least 4."
+
+  ScaleInDpuAmount:
+    Type: String
+    Default: "4"
+    Description: Number of DPUs to remove in response to low utilization signal. Must be a multiple of 4.
+    AllowedPattern: "^([4-9]|[1-9][0-9]+)$"
+    ConstraintDescription: "The number of DPUs must be at least 4."
+
+  HighUtilizationThreshold:
+    Type: Number
+    Default: 75
+    MinValue: 0
+    MaxValue: 100
+    Description: Utilization threshold above which additional capacity is requested. Must be between 0 and 100.
+
+  LowUtilizationThreshold:
+    Type: Number
+    Default: 25
+    MinValue: 0
+    MaxValue: 100
+    Description: Utilization threshold below which capacity is removed. Must be between 0 and 100.
+
+  EvaluationLookbackWindow:
+    Type: Number
+    Default: 300
+    MinValue: 1
+    Description: Amount of time, measured in seconds, to measure historical capacity utilization.
+
+  EvaluationFrequency:
+    Type: String
+    Default: 'rate(5 minutes)'
+    MinLength: 1
+    MaxLength: 256
+    Description: Frequency of utilization evaluation during business hours. Must be an EventBridge schedule expression.
+
+Conditions:
+  HasCustomCapacityName: !Not [!Equals [!Ref CapacityReservationName, '']]
+
+Resources:
+  # Combined Business Hours + Auto-scaling Step Functions
+  AthenaBusinessHoursAutoScalingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-AthenaBusinessHoursAutoScaling'
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: !Sub 
+        - |
+          {
+            "Comment": "Combined Athena Business Hours and Auto-scaling Workflow",
+            "StartAt": "CheckBusinessHours",
+            "States": {
+              "CheckBusinessHours": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                  "FunctionName": "${BusinessHoursCheckFunction}",
+                  "Payload": {
+                    "timezone": "${TimeZone}",
+                    "startTime": "${CapacityReservationStartTime}",
+                    "endTime": "${CapacityReservationEndTime}",
+                    "businessDays": "${BusinessDays}"
+                  }
+                },
+                "ResultPath": "$.businessHoursCheck",
+                "Next": "IsBusinessHours"
+              },
+              "IsBusinessHours": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.businessHoursCheck.Payload.isBusinessHours",
+                    "BooleanEquals": true,
+                    "Next": "CheckCapacityExists"
+                  }
+                ],
+                "Default": "CheckCapacityForCleanup"
+              },
+              "CheckCapacityExists": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:athena:getCapacityReservation",
+                "Parameters": {
+                  "Name": "${CapacityName}"
+                },
+                "ResultPath": "$.capacityCheck",
+                "Catch": [
+                  {
+                  "ErrorEquals": ["Athena.InvalidRequestException"],
+                  "Next": "CreateCapacityReservation",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "CalculateEvaluationTimestamps"
+            },
+            "CreateCapacityReservation": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:athena:createCapacityReservation",
+              "Parameters": {
+                "Name": "${CapacityName}",
+                "TargetDpus": ${InitialCapacity}
+              },
+              "ResultPath": "$.capacityCreation",
+              "Next": "AssignWorkgroupToCapacity"
+            },
+            "AssignWorkgroupToCapacity": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:athena:putCapacityAssignmentConfiguration",
+              "Parameters": {
+                "CapacityReservationName": "${CapacityName}",
+                "CapacityAssignments": [
+                  {
+                    "WorkGroupNames": ["${WorkgroupName}"]
+                  }
+                ]
+              },
+              "ResultPath": "$.workgroupAssignment",
+              "Next": "WaitForCapacityReady"
+            },
+            "WaitForCapacityReady": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "CalculateEvaluationTimestamps"
+            },
+            "CalculateEvaluationTimestamps": {
+              "Type": "Pass",
+              "QueryLanguage": "JSONata",
+              "Output": "{% ($currentTime := $now(); {'Time': {'EndTime': $currentTime, 'StartTime': $fromMillis($toMillis($currentTime) - ${EvaluationLookbackWindow}000)}}) %}",
+              "Next": "GetUtilizationMetric"
+            },
+            "GetUtilizationMetric": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:cloudwatch:getMetricData",
+              "Parameters": {
+                "MetricDataQueries": [
+                  {
+                    "Id": "m1",
+                    "MetricStat": {
+                      "Metric": {
+                        "Namespace": "AWS/Athena",
+                        "MetricName": "DPUAllocated",
+                        "Dimensions": [
+                          {
+                            "Name": "Capacity Reservation",
+                            "Value": "${CapacityName}"
+                          }
+                        ]
+                      },
+                      "Period": ${EvaluationLookbackWindow},
+                      "Stat": "Maximum"
+                    }
+                  },
+                  {
+                    "Id": "m2",
+                    "MetricStat": {
+                      "Metric": {
+                        "Namespace": "AWS/Athena",
+                        "MetricName": "DPUConsumed",
+                        "Dimensions": [
+                          {
+                            "Name": "Capacity Reservation",
+                            "Value": "${CapacityName}"
+                          }
+                        ]
+                      },
+                      "Period": ${EvaluationLookbackWindow},
+                      "Stat": "Maximum"
+                    }
+                  },
+                  {
+                    "Id": "e1",
+                    "Expression": "(m2 / m1) * 100",
+                    "Label": "DPU utilization"
+                  }
+                ],
+                "StartTime.$": "$.Time.StartTime",
+                "EndTime.$": "$.Time.EndTime"
+              },
+              "ResultPath": "$.UtilizationData",
+              "Next": "EvaluateUtilization"
+            },
+            "EvaluateUtilization": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.UtilizationData.MetricDataResults[2].Values[0]",
+                  "IsPresent": true,
+                  "Next": "GetCurrentDpus"
+                }
+              ],
+              "Default": "FinishExecution"
+            },
+            "GetCurrentDpus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:athena:getCapacityReservation",
+              "Parameters": {
+                "Name": "${CapacityName}"
+              },
+              "ResultPath": "$.ReservationDetails",
+              "Next": "DetermineScalingAction"
+            },
+            "DetermineScalingAction": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.UtilizationData.MetricDataResults[2].Values[0]",
+                      "NumericGreaterThan": ${HighUtilizationThreshold}
+                    },
+                    {
+                      "Variable": "$.ReservationDetails.CapacityReservation.AllocatedDpus",
+                      "NumericLessThan": ${MaxCapacity}
+                    }
+                  ],
+                  "Next": "CalculateScaleOutTarget"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.UtilizationData.MetricDataResults[2].Values[0]",
+                      "NumericLessThan": ${LowUtilizationThreshold}
+                    },
+                    {
+                      "Variable": "$.ReservationDetails.CapacityReservation.AllocatedDpus",
+                      "NumericGreaterThan": ${MinTargetDpus}
+                    }
+                  ],
+                  "Next": "CalculateScaleInTarget"
+                }
+              ],
+              "Default": "FinishExecution"
+            },
+            "CalculateScaleOutTarget": {
+              "Type": "Pass",
+              "QueryLanguage": "JSONata",
+              "Output": "{% $merge([$states.input, {'ScaleTarget': {'TargetDpus': $min([$states.input.ReservationDetails.CapacityReservation.AllocatedDpus + ${ScaleOutDpuAmount}, ${MaxCapacity}])}}]) %}",
+              "Next": "ScaleOut"
+            },
+            "CalculateScaleInTarget": {
+              "Type": "Pass",
+              "QueryLanguage": "JSONata",
+              "Output": "{% $merge([$states.input, {'ScaleTarget': {'TargetDpus': $max([$states.input.ReservationDetails.CapacityReservation.AllocatedDpus - ${ScaleInDpuAmount}, ${MinTargetDpus}])}}]) %}",
+              "Next": "ScaleIn"
+            },
+            "ScaleOut": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:athena:updateCapacityReservation",
+              "Parameters": {
+                "Name": "${CapacityName}",
+                "TargetDpus.$": "$.ScaleTarget.TargetDpus"
+              },
+              "Next": "FinishExecution"
+            },
+            "ScaleIn": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:athena:updateCapacityReservation",
+              "Parameters": {
+                "Name": "${CapacityName}",
+                "TargetDpus.$": "$.ScaleTarget.TargetDpus"
+              },
+              "Next": "FinishExecution"
+            },
+            "CheckCapacityForCleanup": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:athena:getCapacityReservation",
+              "Parameters": {
+                "Name": "${CapacityName}"
+              },
+              "ResultPath": "$.capacityCheck",
+              "Catch": [
+                {
+                  "ErrorEquals": ["Athena.InvalidRequestException"],
+                  "Next": "FinishExecution",
+                  "ResultPath": "$.error"
+                }
+              ],
+              "Next": "CleanupCapacity"
+            },
+            "CleanupCapacity": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${StopCapacityFunction}",
+                "Payload": {
+                  "capacityName": "${CapacityName}", "workgroup": "${WorkgroupName}"
+                }
+              },
+              "ResultPath": "$.cleanup",
+              "Next": "FinishExecution"
+            },
+            "FinishExecution": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+          }
+        - CapacityName: !If 
+            - HasCustomCapacityName
+            - !Ref CapacityReservationName
+            - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+
+  # VPC Infrastructure
+  LambdaVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LambdaVpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public'
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LambdaVpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-private'
+
+  NatEip:
+    Type: AWS::EC2::EIP
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LambdaVpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LambdaVpc
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Lambda Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${AWS::StackName} Lambda functions security group'
+      VpcId: !Ref LambdaVpc
+
+  # Dead Letter Queue for Lambda functions
+  LambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-lambda-dlq'
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+
+  # Business Hours Check Function
+  BusinessHoursCheckFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionPolicy
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-BusinessHoursCheck'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Code:
+        ZipFile: |
+          import json
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          
+          def lambda_handler(event, context):
+              try:
+                  tz_name = event['timezone']
+                  start_time = event['startTime']
+                  end_time = event['endTime']
+                  business_days = event['businessDays']
+                  
+                  start_hour, start_minute = map(int, start_time.split(':'))
+                  end_hour, end_minute = map(int, end_time.split(':'))
+                  
+                  now = datetime.now(ZoneInfo(tz_name))
+                  weekday = now.strftime('%a').upper()
+                  
+                  business_day_map = {
+                      'MON-FRI': ['MON', 'TUE', 'WED', 'THU', 'FRI'],
+                      'MON-SAT': ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'],
+                      'MON-SUN': ['MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT', 'SUN'],
+                      'SAT-SUN': ['SAT', 'SUN']
+                  }
+                  
+                  is_business_day = weekday in business_day_map.get(business_days, ['MON', 'TUE', 'WED', 'THU', 'FRI'])
+                  
+                  current_minutes = now.hour * 60 + now.minute
+                  start_minutes = start_hour * 60 + start_minute
+                  end_minutes = end_hour * 60 + end_minute
+                  is_business_hour = start_minutes <= current_minutes < end_minutes
+                  
+                  return {
+                      'isBusinessHours': is_business_day and is_business_hour,
+                      'currentTime': now.isoformat(),
+                      'currentHour': now.hour,
+                      'currentMinute': now.minute,
+                      'weekday': weekday,
+                      'isBusinessDay': is_business_day,
+                      'isBusinessHour': is_business_hour
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'isBusinessHours': False,
+                      'error': str(e)
+                  }
+
+  # Start Capacity Function (same as before)
+  # Stop Capacity Function
+  StopCapacityFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionPolicy
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-StopCapacity'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 360
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          
+          def lambda_handler(event, context):
+              try:
+                  athena = boto3.client('athena')
+                  
+                  capacity_name = event['capacityName']
+                  
+                  # Cancel capacity reservation first
+                  athena.cancel_capacity_reservation(Name=capacity_name)
+                  
+                  # Wait for cancellation to complete
+                  max_attempts = 30
+                  for attempt in range(max_attempts):
+                      response = athena.get_capacity_reservation(Name=capacity_name)
+                      state = response['CapacityReservation']['Status']
+                      
+                      if state == 'CANCELLED':
+                          break
+                      elif state == 'CANCELLING':
+                          time.sleep(10)
+                          continue
+                      else:
+                          raise Exception(f"Unexpected capacity reservation state: {state}")
+                  else:
+                      raise Exception("Timeout waiting for capacity reservation to cancel")
+                  
+                  # Delete capacity reservation
+                  athena.delete_capacity_reservation(Name=capacity_name)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(f'Capacity reservation {capacity_name} cancelled and deleted')
+                  }
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+
+  # EventBridge Rule for Business Hours Evaluation
+  BusinessHoursEvaluationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-BusinessHoursEvaluation'
+      Description: 'Trigger business hours and auto-scaling evaluation'
+      ScheduleExpression: !Ref EvaluationFrequency
+      State: ENABLED
+      Targets:
+        - Arn: !Ref AthenaBusinessHoursAutoScalingStateMachine
+          Id: 'BusinessHoursEvaluationTarget'
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # Custom Resource for Stack Deletion Cleanup
+  CapacityCleanupResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - PrivateSubnetRouteTableAssociation
+      - PrivateRoute
+      - PublicSubnetRouteTableAssociation
+      - PublicRoute
+      - VpcGatewayAttachment
+    Properties:
+      ServiceToken: !GetAtt CapacityCleanupFunction.Arn
+      CapacityName: !If 
+        - HasCustomCapacityName
+        - !Ref CapacityReservationName
+        - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+
+  CapacityCleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionPolicy
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-CapacityCleanup'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDeadLetterQueue.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import time
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  capacity_name = event['ResourceProperties']['CapacityName']
+                  
+                  # Only cleanup on Delete
+                  if event['RequestType'] == 'Delete':
+                      athena = boto3.client('athena')
+                      
+                      try:
+                          # Check if capacity reservation exists
+                          athena.get_capacity_reservation(Name=capacity_name)
+                          
+                          # Cancel capacity reservation
+                          athena.cancel_capacity_reservation(Name=capacity_name)
+                          
+                          # Wait for cancellation, but leave 30s for cfnresponse
+                          while context.get_remaining_time_in_millis() > 30000:
+                              response = athena.get_capacity_reservation(Name=capacity_name)
+                              state = response['CapacityReservation']['Status']
+                              
+                              if state == 'CANCELLED':
+                                  break
+                              time.sleep(10)
+                          
+                          # Delete capacity reservation
+                          athena.delete_capacity_reservation(Name=capacity_name)
+                          print(f"Successfully cleaned up capacity reservation: {capacity_name}")
+                          
+                      except athena.exceptions.InvalidRequestException as e:
+                          # Capacity reservation doesn't exist, that's fine
+                          print(f"Capacity reservation not found or already deleted: {str(e)}")
+                      
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Error during cleanup: {str(e)}")
+                  # Still send SUCCESS to allow stack deletion to proceed
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # IAM Roles
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  EventBridgePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref EventBridgeRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !GetAtt AthenaBusinessHoursAutoScalingStateMachine.Arn
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+  StepFunctionsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref StepFunctionsRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !GetAtt BusinessHoursCheckFunction.Arn
+              - !GetAtt StopCapacityFunction.Arn
+          - Effect: Allow
+            Action:
+              - cloudwatch:GetMetricData
+            Resource: '*'
+          - Effect: Allow
+            Action:
+              - athena:GetCapacityReservation
+              - athena:UpdateCapacityReservation
+              - athena:CreateCapacityReservation
+            Resource: !Sub 
+              - 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:capacity-reservation/${CapacityName}'
+              - CapacityName: !If 
+                  - HasCustomCapacityName
+                  - !Ref CapacityReservationName
+                  - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+          - Effect: Allow
+            Action:
+              - athena:PutCapacityAssignmentConfiguration
+            Resource:
+              - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkgroupName}'
+              - !Sub 
+                - 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:capacity-reservation/${CapacityName}'
+                - CapacityName: !If 
+                    - HasCustomCapacityName
+                    - !Ref CapacityReservationName
+                    - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+          - Effect: Allow
+            Action:
+              - sns:Publish
+            Resource: !Ref NotificationTopic
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: !GetAtt SNSEncryptionKey.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - athena:CreateCapacityReservation
+              - athena:DeleteCapacityReservation
+              - athena:CancelCapacityReservation
+              - athena:GetCapacityReservation
+              - athena:ListCapacityReservations
+            Resource: !Sub 
+              - 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:capacity-reservation/${CapacityName}'
+              - CapacityName: !If 
+                  - HasCustomCapacityName
+                  - !Ref CapacityReservationName
+                  - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+          - Effect: Allow
+            Action:
+              - athena:PutCapacityAssignmentConfiguration
+              - athena:GetCapacityAssignmentConfiguration
+            Resource:
+              - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${WorkgroupName}'
+              - !Sub 
+                - 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:capacity-reservation/${CapacityName}'
+                - CapacityName: !If 
+                    - HasCustomCapacityName
+                    - !Ref CapacityReservationName
+                    - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt LambdaDeadLetterQueue.Arn
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: !GetAtt SNSEncryptionKey.Arn
+
+  # KMS Key for SNS encryption
+  SNSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'KMS key for ${AWS::StackName} SNS topic encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountRoot
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowSNSUsage
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: AllowSQSUsage
+            Effect: Allow
+            Principal:
+              Service: sqs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+
+  SNSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-sns-key'
+      TargetKeyId: !Ref SNSEncryptionKey
+
+  # SNS Topic
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      KmsMasterKeyId: !Ref SNSEncryptionKey
+
+Outputs:
+  StateMachineArn:
+    Description: 'Combined Business Hours + Auto-scaling State Machine ARN'
+    Value: !Ref AthenaBusinessHoursAutoScalingStateMachine
+  
+  CapacityReservationName:
+    Description: 'Name of the Athena capacity reservation'
+    Value: !If 
+      - HasCustomCapacityName
+      - !Ref CapacityReservationName
+      - !Sub '${AWS::StackName}-${WorkgroupName}-capacity'
+  
+  NotificationTopicArn:
+    Description: 'SNS Topic for notifications'
+    Value: !Ref NotificationTopic
+  
+  BusinessHoursSchedule:
+    Description: 'Capacity reservation schedule'
+    Value: !Sub '${CapacityReservationStartTime} - ${CapacityReservationEndTime} ${TimeZone} (${BusinessDays})'
+
+  EvaluationFrequency:
+    Description: 'Auto-scaling evaluation frequency'
+    Value: !Ref EvaluationFrequency
