@@ -6,6 +6,7 @@ A collection of utilities for Amazon Athena.
 
 | Utility | Description |
 |---------|-------------|
+| [athena-backup-restore](athena-backup-restore/) | Back up and restore Athena workgroups, prepared statements, named queries, and data catalogs across AWS regions |
 | [capacity-reservation-automation](capacity-reservation-automation/) | Automate Athena capacity reservations for business hours with integrated auto-scaling |
 
 ## Security
